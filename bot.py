@@ -123,7 +123,8 @@ async def cmd_start(msg: types.Message):
     )
     
     try:
-        photo = FSInputFile("welcome.jpg")
+        # Используем имя файла, которое лежит в репозитории
+        photo = FSInputFile("IMG_7776.jpeg")
         await msg.answer_photo(photo=photo, caption=text, parse_mode="HTML")
     except Exception as e:
         # Если картинки нет, отправляем просто текст
