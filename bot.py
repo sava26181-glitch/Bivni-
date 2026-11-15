@@ -10,6 +10,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiohttp import web
 from aiogram.types import FSInputFile
 from curl_cffi.requests import AsyncSession
+from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO)
 
@@ -25,11 +26,7 @@ dp = Dispatcher(storage=MemoryStorage())
 
 # --- Конфигурация ---
 CONFIG_FILE = "config.json"
-DEFAULT_CONFIG = {
-    "golden_key": "",
-    "epic_accounts": [],
-    "lots": []
-}
+DEFAULT_CONFIG = {"golden_key": "", "epic_accounts": [], "lots": []}
 CONFIG = DEFAULT_CONFIG.copy()
 
 def load_config():
@@ -48,6 +45,7 @@ load_config()
 
 class BotStates(StatesGroup):
     waiting_for_golden_key = State()
+    waiting_for_game_name = State()
     waiting_for_lot_title = State()
     waiting_for_lot_desc = State()
     waiting_for_lot_price = State()
@@ -61,66 +59,86 @@ main_router = Router()
 # --- Функции FunPay ---
 async def funpay_toggle_status(status: str) -> bool:
     if not CONFIG["golden_key"]: return False
-    
     headers = {"x-requested-with": "XMLHttpRequest"}
     cookies = {"golden_key": CONFIG["golden_key"]}
-    
     async with AsyncSession(impersonate="chrome120") as session:
         resp = await session.get("https://funpay.com/", cookies=cookies, headers=headers)
         csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', resp.text)
         csrf = csrf_match.group(1) if csrf_match else ""
-        
-        payload = {
-            "onlines": "enable" if status == "online" else "disable",
-            "csrf_token": csrf
-        }
+        payload = {"onlines": "enable" if status == "online" else "disable", "csrf_token": csrf}
         res = await session.post("https://funpay.com/runner/", data=payload, cookies=cookies, headers=headers)
         return res.status_code == 200
 
 async def funpay_withdraw(amount: float, wallet: str, currency: str = "rub") -> bool:
     if not CONFIG["golden_key"]: return False
-    
     headers = {"x-requested-with": "XMLHttpRequest"}
     cookies = {"golden_key": CONFIG["golden_key"]}
-    
     async with AsyncSession(impersonate="chrome120") as session:
         resp = await session.get("https://funpay.com/account/balance", cookies=cookies, headers=headers)
         csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', resp.text)
         csrf = csrf_match.group(1) if csrf_match else ""
-        
-        payload = {
-            "csrf_token": csrf,
-            "preview": "",
-            "currency_id": currency,
-            "ext_currency_id": "card_rub",
-            "wallet": wallet,
-            "amount_int": amount
-        }
+        payload = {"csrf_token": csrf, "preview": "", "currency_id": currency, "ext_currency_id": "card_rub", "wallet": wallet, "amount_int": amount}
         res = await session.post("https://funpay.com/withdraw/withdraw", data=payload, cookies=cookies, headers=headers)
         return res.status_code == 200
 
-async def funpay_create_lot(title: str, desc: str, price: float, category_id: int = 2418) -> bool:
+async def funpay_create_lot(game_name: str, title: str, desc: str, price: float) -> bool:
+    """Ищет игру, находит категорию 'Аккаунты' и создает лот."""
     if not CONFIG["golden_key"]: return False
     
     headers = {"x-requested-with": "XMLHttpRequest"}
     cookies = {"golden_key": CONFIG["golden_key"]}
     
     async with AsyncSession(impersonate="chrome120") as session:
+        # 1. Получаем страницу создания лота
         resp = await session.get("https://funpay.com/lots/new", cookies=cookies, headers=headers)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        
         csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', resp.text)
         csrf = csrf_match.group(1) if csrf_match else ""
         
-        # Внимание: структура payload зависит от реальной формы FunPay!
+        # 2. Ищем игру
+        game_id = None
+        game_select = soup.find('select', {'name': 'game_id'})
+        if game_select:
+            for option in game_select.find_all('option'):
+                if game_name.lower() in option.text.lower():
+                    game_id = option.get('value')
+                    break
+                    
+        if not game_id:
+            logging.error(f"Игра {game_name} не найдена.")
+            return False
+            
+        # 3. Получаем список категорий для выбранной игры (в FunPay это отдельный AJAX запрос)
+        # Обычно URL: https://funpay.com/lots/getCategories?game_id={game_id}
+        cat_resp = await session.get(f"https://funpay.com/lots/getCategories?game_id={game_id}", cookies=cookies, headers=headers)
+        
+        category_id = None
+        try:
+            cats = cat_resp.json()
+            # Ищем категорию "Аккаунты" (или можно сделать поиск по названию)
+            for cat in cats:
+                if "аккаунт" in cat['name'].lower():
+                    category_id = cat['id']
+                    break
+            if not category_id and cats:
+                category_id = cats[0]['id'] # Берем первую, если "Аккаунты" не найдены
+        except:
+            logging.error("Не удалось распарсить категории.")
+            return False
+
+        # 4. Отправляем лот
         payload = {
             "csrf_token": csrf,
+            "game_id": game_id,
             "category_id": category_id,
-            "subcategory_id": "", 
             "title": title,
             "description": desc,
             "price": price,
             "amount": 1,
             "active": "on"
         }
+        
         res = await session.post("https://funpay.com/lots/save", data=payload, cookies=cookies, headers=headers)
         return res.status_code == 200
 
@@ -129,7 +147,6 @@ async def funpay_create_lot(title: str, desc: str, price: float, category_id: in
 @main_router.message(Command("start"))
 async def cmd_start(msg: types.Message):
     key_status = "✅" if CONFIG["golden_key"] else "❌"
-    
     text = (
         f"🤖 <b>Панель управления FunPay</b>\n\n"
         f"🔑 Golden Key: {key_status}\n\n"
@@ -143,12 +160,10 @@ async def cmd_start(msg: types.Message):
         "/toggle_status — Вкл/Выкл Онлайн\n"
         "/withdraw — Вывести средства\n"
     )
-    
     try:
         photo = FSInputFile("IMG_7776.jpeg")
         await msg.answer_photo(photo=photo, caption=text, parse_mode="HTML")
     except Exception as e:
-        logging.error(f"Ошибка отправки фото: {e}")
         await msg.answer(text, parse_mode="HTML")
 
 @main_router.message(Command("set_key"))
@@ -191,16 +206,21 @@ async def process_withdraw(msg: types.Message, state: FSMContext):
         await msg.answer("❌ Введи число.")
     await state.clear()
 
-# --- Создание лота ---
 @main_router.message(Command("create_lot"))
 async def cmd_create_lot(msg: types.Message, state: FSMContext):
+    await msg.answer("Введи название игры (например, 'Fortnite'):")
+    await state.set_state(BotStates.waiting_for_game_name)
+
+@main_router.message(BotStates.waiting_for_game_name)
+async def process_game_name(msg: types.Message, state: FSMContext):
+    await state.update_data(game_name=msg.text.strip())
     await msg.answer("Введи название лота:")
     await state.set_state(BotStates.waiting_for_lot_title)
 
 @main_router.message(BotStates.waiting_for_lot_title)
 async def process_lot_title(msg: types.Message, state: FSMContext):
     await state.update_data(title=msg.text)
-    await msg.answer("Введи описание лота (с указанием, что почта не полная):")
+    await msg.answer("Введи описание лота:")
     await state.set_state(BotStates.waiting_for_lot_desc)
 
 @main_router.message(BotStates.waiting_for_lot_desc)
@@ -231,9 +251,14 @@ async def process_lot_photo(msg: types.Message, state: FSMContext):
         await msg.answer("Отправь фото или /skip.")
         return
 
-    await msg.answer("🔄 Отправляю лот на FunPay...")
+    await msg.answer("🔄 Ищу игру, категорию 'Аккаунты' и отправляю лот...")
     
-    success = await funpay_create_lot(data["title"], data["desc"], data["price"])
+    success = await funpay_create_lot(
+        data["game_name"], 
+        data["title"], 
+        data["desc"], 
+        data["price"]
+    )
     
     if success:
         CONFIG["lots"].append({
@@ -243,9 +268,9 @@ async def process_lot_photo(msg: types.Message, state: FSMContext):
             "photo": photo_id
         })
         save_config()
-        await msg.answer(f"✅ Лот '{data['title']}' создан на FunPay и добавлен в базу.")
+        await msg.answer(f"✅ Лот '{data['title']}' создан на FunPay.")
     else:
-        await msg.answer("⚠️ Не удалось создать лот на FunPay. Возможно, неверный CSRF или изменился API.")
+        await msg.answer("⚠️ Не удалось создать лот. Проверь логи Render (возможно, неверное название игры или API-запрос отклонен).")
         
     await state.clear()
 
@@ -254,13 +279,11 @@ async def cmd_list_lots(msg: types.Message):
     if not CONFIG["lots"]:
         await msg.answer("База лотов пуста.")
         return
-    
     text = "📦 <b>Твои лоты:</b>\n\n"
     for i, lot in enumerate(CONFIG["lots"], 1):
-        text += f"{i}. <b>{lot['title']}</b>\nЦена: {lot['price']} ₽\nОписание: {lot['desc']}\n\n"
+        text += f"{i}. <b>{lot['title']}</b>\nЦена: {lot['price']} ₽\n\n"
     await msg.answer(text, parse_mode="HTML")
 
-# --- Добавление аккаунта Epic ---
 @main_router.message(Command("add_acc"))
 async def cmd_add_acc(msg: types.Message, state: FSMContext):
     await msg.answer("Введи email от Epic Games:")
@@ -285,7 +308,6 @@ async def cmd_list_acc(msg: types.Message):
     if not CONFIG["epic_accounts"]:
         await msg.answer("База аккаунтов Epic пуста.")
         return
-    
     text = "🎮 <b>Аккаунты Epic:</b>\n\n"
     for i, acc in enumerate(CONFIG["epic_accounts"], 1):
         text += f"{i}. Email: <code>{acc['email']}</code>\nПароль: <code>{acc['password']}</code>\n\n"
@@ -320,3 +342,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
