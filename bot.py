@@ -1,7 +1,7 @@
 import asyncio, os, re, logging, json, time
 from datetime import datetime
 import aiohttp
-from aiogram import Bot, Dispatcher, types, Router
+from aiogram import Bot, Dispatcher, types, Router, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -127,6 +127,7 @@ async def cmd_start(msg: types.Message):
         photo = FSInputFile("IMG_7776.jpeg")
         await msg.answer_photo(photo=photo, caption=text, parse_mode="HTML")
     except Exception as e:
+        logging.error(f"Ошибка отправки фото: {e}")
         # Если картинки нет, отправляем просто текст
         await msg.answer(text, parse_mode="HTML")
 
@@ -198,7 +199,8 @@ async def process_lot_price(msg: types.Message, state: FSMContext):
     except:
         await msg.answer("❌ Введи число.")
 
-@main_router.message(BotStates.waiting_for_lot_photo, content_types=['photo', 'text'])
+# ИСПРАВЛЕНО: используем фильтр F.photo | F.text
+@main_router.message(BotStates.waiting_for_lot_photo, F.photo | F.text)
 async def process_lot_photo(msg: types.Message, state: FSMContext):
     data = await state.get_data()
     
