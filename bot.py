@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO)
 
 TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://fakefarm.onrender.com"
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://bivni.onrender.com"
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_FULL = WEBHOOK_URL.rstrip("/") + WEBHOOK_PATH
 PORT = int(os.environ.get("PORT", 8080))
@@ -60,14 +60,12 @@ main_router = Router()
 
 # --- Функции FunPay ---
 async def funpay_toggle_status(status: str) -> bool:
-    """Включает или выключает онлайн статус."""
     if not CONFIG["golden_key"]: return False
     
     headers = {"x-requested-with": "XMLHttpRequest"}
     cookies = {"golden_key": CONFIG["golden_key"]}
     
     async with AsyncSession(impersonate="chrome120") as session:
-        # Получаем csrf
         resp = await session.get("https://funpay.com/", cookies=cookies, headers=headers)
         csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', resp.text)
         csrf = csrf_match.group(1) if csrf_match else ""
@@ -80,7 +78,6 @@ async def funpay_toggle_status(status: str) -> bool:
         return res.status_code == 200
 
 async def funpay_withdraw(amount: float, wallet: str, currency: str = "rub") -> bool:
-    """Вывод средств на карту/кошелек."""
     if not CONFIG["golden_key"]: return False
     
     headers = {"x-requested-with": "XMLHttpRequest"}
@@ -100,6 +97,31 @@ async def funpay_withdraw(amount: float, wallet: str, currency: str = "rub") -> 
             "amount_int": amount
         }
         res = await session.post("https://funpay.com/withdraw/withdraw", data=payload, cookies=cookies, headers=headers)
+        return res.status_code == 200
+
+async def funpay_create_lot(title: str, desc: str, price: float, category_id: int = 2418) -> bool:
+    if not CONFIG["golden_key"]: return False
+    
+    headers = {"x-requested-with": "XMLHttpRequest"}
+    cookies = {"golden_key": CONFIG["golden_key"]}
+    
+    async with AsyncSession(impersonate="chrome120") as session:
+        resp = await session.get("https://funpay.com/lots/new", cookies=cookies, headers=headers)
+        csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', resp.text)
+        csrf = csrf_match.group(1) if csrf_match else ""
+        
+        # Внимание: структура payload зависит от реальной формы FunPay!
+        payload = {
+            "csrf_token": csrf,
+            "category_id": category_id,
+            "subcategory_id": "", 
+            "title": title,
+            "description": desc,
+            "price": price,
+            "amount": 1,
+            "active": "on"
+        }
+        res = await session.post("https://funpay.com/lots/save", data=payload, cookies=cookies, headers=headers)
         return res.status_code == 200
 
 # --- Обработчики Aiogram ---
@@ -123,12 +145,10 @@ async def cmd_start(msg: types.Message):
     )
     
     try:
-        # Используем имя файла, которое лежит в репозитории
         photo = FSInputFile("IMG_7776.jpeg")
         await msg.answer_photo(photo=photo, caption=text, parse_mode="HTML")
     except Exception as e:
         logging.error(f"Ошибка отправки фото: {e}")
-        # Если картинки нет, отправляем просто текст
         await msg.answer(text, parse_mode="HTML")
 
 @main_router.message(Command("set_key"))
@@ -162,8 +182,7 @@ async def process_withdraw(msg: types.Message, state: FSMContext):
     try:
         amount = float(msg.text)
         await msg.answer("🔄 Отправляю запрос на вывод...")
-        # Замени "1111 2222 3333 4444" на твою реальную карту
-        success = await funpay_withdraw(amount, "1111 2222 3333 4444") 
+        success = await funpay_withdraw(amount, "1111 2222 3333 4444") # Замени на карту
         if success:
             await msg.answer(f"✅ Запрос на вывод {amount} ₽ отправлен.")
         else:
@@ -199,7 +218,6 @@ async def process_lot_price(msg: types.Message, state: FSMContext):
     except:
         await msg.answer("❌ Введи число.")
 
-# ИСПРАВЛЕНО: используем фильтр F.photo | F.text
 @main_router.message(BotStates.waiting_for_lot_photo, F.photo | F.text)
 async def process_lot_photo(msg: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -213,15 +231,22 @@ async def process_lot_photo(msg: types.Message, state: FSMContext):
         await msg.answer("Отправь фото или /skip.")
         return
 
-    CONFIG["lots"].append({
-        "title": data["title"],
-        "desc": data["desc"],
-        "price": data["price"],
-        "photo": photo_id
-    })
-    save_config()
+    await msg.answer("🔄 Отправляю лот на FunPay...")
     
-    await msg.answer(f"✅ Лот '{data['title']}' добавлен в базу.")
+    success = await funpay_create_lot(data["title"], data["desc"], data["price"])
+    
+    if success:
+        CONFIG["lots"].append({
+            "title": data["title"],
+            "desc": data["desc"],
+            "price": data["price"],
+            "photo": photo_id
+        })
+        save_config()
+        await msg.answer(f"✅ Лот '{data['title']}' создан на FunPay и добавлен в базу.")
+    else:
+        await msg.answer("⚠️ Не удалось создать лот на FunPay. Возможно, неверный CSRF или изменился API.")
+        
     await state.clear()
 
 @main_router.message(Command("list_lots"))
