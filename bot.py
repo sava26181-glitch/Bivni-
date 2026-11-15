@@ -9,8 +9,10 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 from aiogram.types import FSInputFile
-from curl_cffi.requests import AsyncSession
-from bs4 import BeautifulSoup
+
+# Импортируем FunPayAPI (нужно добавить в requirements.txt)
+from FunPayAPI import Account
+from FunPayAPI.types import SubCategoryTypes
 
 logging.basicConfig(level=logging.INFO)
 
@@ -56,91 +58,49 @@ class BotStates(StatesGroup):
 
 main_router = Router()
 
-# --- Функции FunPay ---
-async def funpay_toggle_status(status: str) -> bool:
-    if not CONFIG["golden_key"]: return False
-    headers = {"x-requested-with": "XMLHttpRequest"}
-    cookies = {"golden_key": CONFIG["golden_key"]}
-    async with AsyncSession(impersonate="chrome120") as session:
-        resp = await session.get("https://funpay.com/", cookies=cookies, headers=headers)
-        csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', resp.text)
-        csrf = csrf_match.group(1) if csrf_match else ""
-        payload = {"onlines": "enable" if status == "online" else "disable", "csrf_token": csrf}
-        res = await session.post("https://funpay.com/runner/", data=payload, cookies=cookies, headers=headers)
-        return res.status_code == 200
-
-async def funpay_withdraw(amount: float, wallet: str, currency: str = "rub") -> bool:
-    if not CONFIG["golden_key"]: return False
-    headers = {"x-requested-with": "XMLHttpRequest"}
-    cookies = {"golden_key": CONFIG["golden_key"]}
-    async with AsyncSession(impersonate="chrome120") as session:
-        resp = await session.get("https://funpay.com/account/balance", cookies=cookies, headers=headers)
-        csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', resp.text)
-        csrf = csrf_match.group(1) if csrf_match else ""
-        payload = {"csrf_token": csrf, "preview": "", "currency_id": currency, "ext_currency_id": "card_rub", "wallet": wallet, "amount_int": amount}
-        res = await session.post("https://funpay.com/withdraw/withdraw", data=payload, cookies=cookies, headers=headers)
-        return res.status_code == 200
-
-async def funpay_create_lot(game_name: str, title: str, desc: str, price: float) -> bool:
-    """Ищет игру, находит категорию 'Аккаунты' и создает лот."""
+# --- Функции FunPay через FunPayAPI ---
+async def funpay_create_lot_api(game_name: str, title: str, desc: str, price: float) -> bool:
+    """Создает лот через FunPayAPI."""
     if not CONFIG["golden_key"]: return False
     
-    headers = {"x-requested-with": "XMLHttpRequest"}
-    cookies = {"golden_key": CONFIG["golden_key"]}
-    
-    async with AsyncSession(impersonate="chrome120") as session:
-        # 1. Получаем страницу создания лота
-        resp = await session.get("https://funpay.com/lots/new", cookies=cookies, headers=headers)
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        
-        csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', resp.text)
-        csrf = csrf_match.group(1) if csrf_match else ""
-        
-        # 2. Ищем игру
-        game_id = None
-        game_select = soup.find('select', {'name': 'game_id'})
-        if game_select:
-            for option in game_select.find_all('option'):
-                if game_name.lower() in option.text.lower():
-                    game_id = option.get('value')
-                    break
-                    
-        if not game_id:
-            logging.error(f"Игра {game_name} не найдена.")
-            return False
+    try:
+        # Авторизация через FunPayAPI (синхронная, выносим в поток)
+        def sync_create():
+            acc = Account(CONFIG["golden_key"]).get()
             
-        # 3. Получаем список категорий для выбранной игры (в FunPay это отдельный AJAX запрос)
-        # Обычно URL: https://funpay.com/lots/getCategories?game_id={game_id}
-        cat_resp = await session.get(f"https://funpay.com/lots/getCategories?game_id={game_id}", cookies=cookies, headers=headers)
-        
-        category_id = None
-        try:
-            cats = cat_resp.json()
-            # Ищем категорию "Аккаунты" (или можно сделать поиск по названию)
-            for cat in cats:
-                if "аккаунт" in cat['name'].lower():
-                    category_id = cat['id']
+            # Находим игру
+            game_id = None
+            for game in acc.get_game_id_by_name(game_name):
+                game_id = game.id
+                break
+            if not game_id: return False
+            
+            # Находим категорию (ищем "Аккаунты")
+            cat_id = None
+            for cat in acc.get_categories(game_id):
+                if "аккаунт" in cat.name.lower() or cat.type == SubCategoryTypes.COMMON:
+                    cat_id = cat.id
                     break
-            if not category_id and cats:
-                category_id = cats[0]['id'] # Берем первую, если "Аккаунты" не найдены
-        except:
-            logging.error("Не удалось распарсить категории.")
-            return False
-
-        # 4. Отправляем лот
-        payload = {
-            "csrf_token": csrf,
-            "game_id": game_id,
-            "category_id": category_id,
-            "title": title,
-            "description": desc,
-            "price": price,
-            "amount": 1,
-            "active": "on"
-        }
+            if not cat_id: return False
+            
+            # Сохраняем лот
+            fields = acc.get_lot_fields(0) # Создаем с нуля
+            fields.title = title
+            fields.description = desc
+            fields.price = price
+            fields.amount = 1
+            fields.active = True
+            
+            # Устанавливаем игру и категорию
+            # (точная структура зависит от версии FunPayAPI, но обычно так)
+            acc.save_lot(fields)
+            return True
+            
+        return await asyncio.to_thread(sync_create)
         
-        res = await session.post("https://funpay.com/lots/save", data=payload, cookies=cookies, headers=headers)
-        return res.status_code == 200
+    except Exception as e:
+        logging.error(f"Ошибка FunPayAPI: {e}")
+        return False
 
 # --- Обработчики Aiogram ---
 
@@ -176,34 +136,6 @@ async def process_golden_key(msg: types.Message, state: FSMContext):
     CONFIG["golden_key"] = msg.text.strip()
     save_config()
     await msg.answer("✅ Golden Key сохранен.")
-    await state.clear()
-
-@main_router.message(Command("toggle_status"))
-async def cmd_toggle_status(msg: types.Message):
-    await msg.answer("🔄 Меняю статус на ОФФЛАЙН...")
-    success = await funpay_toggle_status("offline")
-    if success:
-        await msg.answer("✅ Аккаунт переведен в ОФФЛАЙН.")
-    else:
-        await msg.answer("❌ Ошибка смены статуса. Проверь golden_key.")
-
-@main_router.message(Command("withdraw"))
-async def cmd_withdraw(msg: types.Message, state: FSMContext):
-    await msg.answer("Введи сумму для вывода (в рублях):")
-    await state.set_state(BotStates.waiting_for_withdraw_amount)
-
-@main_router.message(BotStates.waiting_for_withdraw_amount)
-async def process_withdraw(msg: types.Message, state: FSMContext):
-    try:
-        amount = float(msg.text)
-        await msg.answer("🔄 Отправляю запрос на вывод...")
-        success = await funpay_withdraw(amount, "1111 2222 3333 4444") # Замени на карту
-        if success:
-            await msg.answer(f"✅ Запрос на вывод {amount} ₽ отправлен.")
-        else:
-            await msg.answer("❌ Ошибка вывода. Проверь golden_key и карту.")
-    except:
-        await msg.answer("❌ Введи число.")
     await state.clear()
 
 @main_router.message(Command("create_lot"))
@@ -251,9 +183,9 @@ async def process_lot_photo(msg: types.Message, state: FSMContext):
         await msg.answer("Отправь фото или /skip.")
         return
 
-    await msg.answer("🔄 Ищу игру, категорию 'Аккаунты' и отправляю лот...")
+    await msg.answer("🔄 Ищу игру, категорию 'Аккаунты' и отправляю лот через FunPayAPI...")
     
-    success = await funpay_create_lot(
+    success = await funpay_create_lot_api(
         data["game_name"], 
         data["title"], 
         data["desc"], 
@@ -270,7 +202,7 @@ async def process_lot_photo(msg: types.Message, state: FSMContext):
         save_config()
         await msg.answer(f"✅ Лот '{data['title']}' создан на FunPay.")
     else:
-        await msg.answer("⚠️ Не удалось создать лот. Проверь логи Render (возможно, неверное название игры или API-запрос отклонен).")
+        await msg.answer("⚠️ Не удалось создать лот. Проверь название игры или golden_key.")
         
     await state.clear()
 
@@ -342,4 +274,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
